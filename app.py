@@ -5,8 +5,9 @@ import string
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-import aiosqlite
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -23,11 +24,11 @@ import uvicorn
 
 
 # ============================================================
-# NASTROYKA BOT — FULL VERSION
+# NASTROYKA BOT — NEON (PostgreSQL) VERSION
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "nastroyka.db").strip() or "nastroyka.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SUPPORT = os.getenv("SUPPORT", "@ruzvix").strip() or "@ruzvix"
 
 ADMIN_IDS = {
@@ -72,30 +73,88 @@ class Form(StatesGroup):
 
 
 # ============================================================
-# SQLITE COMPATIBILITY HELPERS
+# POSTGRES (NEON) HELPERS
 # ============================================================
 
-async def fetchone(connection, query, params=()):
-    async with connection.execute(query, params) as cursor:
-        return await cursor.fetchone()
+pool: Optional[asyncpg.Pool] = None
 
 
-async def fetchall(connection, query, params=()):
-    async with connection.execute(query, params) as cursor:
-        return await cursor.fetchall()
+def _clean_dsn(url: str) -> str:
+    """Neon URL dagi sslmode / channel_binding parametrlarini olib tashlaydi (asyncpg uchun)."""
+    p = urlparse(url)
+    q = [
+        (k, v) for k, v in parse_qsl(p.query)
+        if k.lower() not in ("sslmode", "channel_binding")
+    ]
+    return urlunparse(p._replace(query=urlencode(q)))
+
+
+def _convert(query: str) -> str:
+    """SQLite uslubidagi ? ni PostgreSQL $1, $2 ... ga almashtiradi."""
+    out = []
+    n = 0
+    for ch in query:
+        if ch == "?":
+            n += 1
+            out.append(f"${n}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+class Result:
+    def __init__(self, status: str):
+        self.status = status or ""
+        last = self.status.split()[-1] if self.status.split() else "0"
+        self.rowcount = int(last) if last.isdigit() else 0
+
+
+class Conn:
+    def __init__(self, conn: asyncpg.Connection):
+        self.conn = conn
+
+    async def execute(self, query, params=()):
+        q = _convert(query)
+        if params:
+            status = await self.conn.execute(q, *params)
+        else:
+            status = await self.conn.execute(q)
+        return Result(status)
+
+    async def executescript(self, script: str):
+        await self.conn.execute(script)
+
+    async def executemany(self, query, rows):
+        await self.conn.executemany(_convert(query), rows)
+
+    def transaction(self):
+        return self.conn.transaction()
+
+    async def commit(self):
+        # asyncpg autocommit rejimida ishlaydi
+        return None
+
+    async def close(self):
+        if pool is not None:
+            await pool.release(self.conn)
+
+
+async def fetchone(connection: Conn, query, params=()):
+    return await connection.conn.fetchrow(_convert(query), *params)
+
+
+async def fetchall(connection: Conn, query, params=()):
+    return await connection.conn.fetch(_convert(query), *params)
 
 
 db_write_lock = asyncio.Lock()
 
 
-async def db():
-    c = await aiosqlite.connect(DB_PATH, timeout=30)
-    c.row_factory = aiosqlite.Row
-    await c.execute("PRAGMA journal_mode=WAL")
-    await c.execute("PRAGMA busy_timeout=30000")
-    await c.execute("PRAGMA synchronous=NORMAL")
-    await c.execute("PRAGMA foreign_keys=ON")
-    return c
+async def db() -> Conn:
+    if pool is None:
+        raise RuntimeError("Database pool tayyor emas")
+    conn = await pool.acquire()
+    return Conn(conn)
 
 
 async def now_iso():
@@ -108,238 +167,234 @@ async def now_iso():
 
 async def init_db():
     c = await db()
-    await c.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        referrals INTEGER DEFAULT 0,
-        referred_by INTEGER,
-        banned INTEGER DEFAULT 0,
-        created_at TEXT,
-        last_seen TEXT
-    );
+    try:
+        await c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            referrals INTEGER DEFAULT 0,
+            referred_by BIGINT,
+            banned INTEGER DEFAULT 0,
+            created_at TEXT,
+            last_seen TEXT
+        );
 
-    CREATE TABLE IF NOT EXISTS brands (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE NOT NULL,
-        emoji TEXT DEFAULT '📱',
-        active INTEGER DEFAULT 1,
-        sort INTEGER DEFAULT 0
-    );
+        CREATE TABLE IF NOT EXISTS brands (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            emoji TEXT DEFAULT '📱',
+            active INTEGER DEFAULT 1,
+            sort INTEGER DEFAULT 0
+        );
 
-    CREATE TABLE IF NOT EXISTS models (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        brand_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        active INTEGER DEFAULT 1,
-        sort INTEGER DEFAULT 0,
-        UNIQUE(brand_id, name)
-    );
+        CREATE TABLE IF NOT EXISTS models (
+            id SERIAL PRIMARY KEY,
+            brand_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            sort INTEGER DEFAULT 0,
+            UNIQUE(brand_id, name)
+        );
 
-    CREATE TABLE IF NOT EXISTS packages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        emoji TEXT DEFAULT '🟢',
-        refs INTEGER NOT NULL DEFAULT 0,
-        description TEXT DEFAULT '',
-        active INTEGER DEFAULT 1,
-        sort INTEGER DEFAULT 0
-    );
+        CREATE TABLE IF NOT EXISTS packages (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            emoji TEXT DEFAULT '🟢',
+            refs INTEGER NOT NULL DEFAULT 0,
+            description TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            sort INTEGER DEFAULT 0
+        );
 
-    CREATE TABLE IF NOT EXISTS channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT UNIQUE NOT NULL,
-        title TEXT,
-        link TEXT,
-        active INTEGER DEFAULT 1
-    );
+        CREATE TABLE IF NOT EXISTS channels (
+            id SERIAL PRIMARY KEY,
+            chat_id TEXT UNIQUE NOT NULL,
+            title TEXT,
+            link TEXT,
+            active INTEGER DEFAULT 1
+        );
 
-    CREATE TABLE IF NOT EXISTS codes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        code TEXT UNIQUE NOT NULL,
-        user_id INTEGER NOT NULL,
-        brand TEXT,
-        model TEXT,
-        package TEXT,
-        refs_used INTEGER DEFAULT 0,
-        used INTEGER DEFAULT 0,
-        created_at TEXT,
-        used_at TEXT
-    );
+        CREATE TABLE IF NOT EXISTS codes (
+            id SERIAL PRIMARY KEY,
+            code TEXT UNIQUE NOT NULL,
+            user_id BIGINT NOT NULL,
+            brand TEXT,
+            model TEXT,
+            package TEXT,
+            refs_used INTEGER DEFAULT 0,
+            used INTEGER DEFAULT 0,
+            created_at TEXT,
+            used_at TEXT
+        );
 
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
 
-    CREATE TABLE IF NOT EXISTS referrals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        inviter_id INTEGER,
-        invitee_id INTEGER UNIQUE,
-        created_at TEXT
-    );
+        CREATE TABLE IF NOT EXISTS referrals (
+            id SERIAL PRIMARY KEY,
+            inviter_id BIGINT,
+            invitee_id BIGINT UNIQUE,
+            created_at TEXT
+        );
 
-    CREATE TABLE IF NOT EXISTS user_selections (
-        user_id INTEGER PRIMARY KEY,
-        model_id INTEGER,
-        updated_at TEXT
-    );
+        CREATE TABLE IF NOT EXISTS user_selections (
+            user_id BIGINT PRIMARY KEY,
+            model_id INTEGER,
+            updated_at TEXT
+        );
 
-    CREATE TABLE IF NOT EXISTS audit (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER,
-        action TEXT,
-        target TEXT,
-        created_at TEXT
-    );
-    """)
+        CREATE TABLE IF NOT EXISTS audit (
+            id SERIAL PRIMARY KEY,
+            admin_id BIGINT,
+            action TEXT,
+            target TEXT,
+            created_at TEXT
+        );
 
-    migrations = [
-        ("packages", "description", "TEXT DEFAULT ''"),
-        ("channels", "link", "TEXT"),
-    ]
-    for table, column, definition in migrations:
-        try:
-            await c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        except Exception:
-            pass
+        ALTER TABLE packages ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
+        ALTER TABLE channels ADD COLUMN IF NOT EXISTS link TEXT;
+        """)
 
-    defaults = {
-        "start_text": (
-            "🔥 <b>NASTROYKA BOT</b>\n\n"
-            "🎮 Free Fire uchun professional telefon sozlamalari.\n\n"
-            "📱 Telefoningiz brendini tanlang:"
-        ),
-        "support": SUPPORT,
-        "ref_enabled": "1",
-        "welcome_footer": "⚡ Tez • Qulay • Tartibli",
-    }
-    for key, value in defaults.items():
-        await c.execute(
-            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-            (key, value)
-        )
-
-    packages = [
-        ("BASE", "🟢", 1, "Boshlang‘ich paket", 1),
-        ("PREMIUM", "🟡", 2, "Kengaytirilgan paket", 2),
-        ("VIP", "🔴", 3, "Eng yuqori paket", 3),
-    ]
-    for name, emoji, refs, description, sort in packages:
-        await c.execute(
-            """
-            INSERT OR IGNORE INTO packages(name,emoji,refs,description,sort)
-            VALUES(?,?,?,?,?)
-            """,
-            (name, emoji, refs, description, sort)
-        )
-
-    brand_data = [
-        ("iPhone", "📱", 1),
-        ("Samsung", "📱", 2),
-        ("Xiaomi", "📱", 3),
-        ("Redmi", "📱", 4),
-        ("POCO", "📱", 5),
-        ("Realme", "📱", 6),
-        ("Infinix", "📱", 7),
-        ("Honor", "📱", 8),
-        ("Tecno", "📱", 9),
-        ("OPPO", "📱", 10),
-        ("Vivo", "📱", 11),
-    ]
-    for name, emoji, sort in brand_data:
-        await c.execute(
-            "INSERT OR IGNORE INTO brands(name,emoji,sort) VALUES(?,?,?)",
-            (name, emoji, sort)
-        )
-
-    await c.execute("UPDATE brands SET emoji='📱'")
-
-    model_data = {
-        "iPhone": [
-            "iPhone 11", "iPhone 11 Pro", "iPhone 11 Pro Max",
-            "iPhone 12", "iPhone 12 Pro", "iPhone 12 Pro Max",
-            "iPhone 13", "iPhone 13 Pro", "iPhone 13 Pro Max",
-            "iPhone 14", "iPhone 14 Pro", "iPhone 14 Pro Max",
-            "iPhone 15", "iPhone 15 Pro", "iPhone 15 Pro Max",
-            "iPhone 16", "iPhone 16 Pro", "iPhone 16 Pro Max",
-            "iPhone 17", "iPhone 17 Pro", "iPhone 17 Pro Max",
-        ],
-        "Samsung": [
-            "Galaxy A15", "Galaxy A25", "Galaxy A35", "Galaxy A55",
-            "Galaxy S21", "Galaxy S21 Ultra", "Galaxy S22", "Galaxy S22 Ultra",
-            "Galaxy S23", "Galaxy S23 Ultra", "Galaxy S24", "Galaxy S24 Ultra",
-            "Galaxy S25", "Galaxy S25 Ultra", "Galaxy S26", "Galaxy S26 Ultra",
-            "Galaxy Note 20", "Galaxy Z Flip 5", "Galaxy Z Fold 5",
-            "Galaxy Z Flip 6", "Galaxy Z Fold 6",
-        ],
-        "Xiaomi": [
-            "Xiaomi 12", "Xiaomi 12 Pro", "Xiaomi 13", "Xiaomi 13 Pro",
-            "Xiaomi 14", "Xiaomi 14 Pro", "Xiaomi 15", "Xiaomi 15 Pro",
-            "Xiaomi 15 Ultra", "Xiaomi 16", "Xiaomi 16 Pro",
-        ],
-        "Redmi": [
-            "Redmi 10", "Redmi 10C", "Redmi 12", "Redmi 13",
-            "Redmi 14C", "Redmi Note 10", "Redmi Note 11", "Redmi Note 12",
-            "Redmi Note 13", "Redmi Note 14", "Redmi Note 15",
-            "Redmi Note 14 Pro", "Redmi Note 15 Pro",
-        ],
-        "POCO": [
-            "POCO X3", "POCO X3 Pro", "POCO X4 Pro", "POCO X5 Pro",
-            "POCO X6", "POCO X6 Pro", "POCO X7", "POCO X7 Pro",
-            "POCO F4", "POCO F5", "POCO F6", "POCO F7",
-            "POCO M5", "POCO M6",
-        ],
-        "Realme": [
-            "Realme 8", "Realme 9", "Realme 10", "Realme 11",
-            "Realme 12", "Realme 13", "Realme 14",
-            "Realme C35", "Realme C55", "Realme C67", "Realme C75",
-            "Realme GT Neo 5", "Realme GT 6", "Realme GT 7",
-        ],
-        "Infinix": [
-            "Hot 10", "Hot 11", "Hot 12", "Hot 20", "Hot 30",
-            "Hot 40", "Hot 50", "Hot 60", "Note 10", "Note 12",
-            "Note 30", "Note 40", "Note 50", "GT 10 Pro", "GT 20 Pro",
-        ],
-        "Honor": [
-            "X8", "X8a", "X8b", "X9", "X9a", "X9b", "X9c",
-            "90", "90 Lite", "200", "200 Pro", "400", "400 Pro",
-            "Magic 5 Pro", "Magic 6 Pro", "Magic 7 Pro",
-        ],
-        "Tecno": [
-            "Spark 8", "Spark 9", "Spark 10", "Spark 20", "Spark 30", "Spark 40",
-            "Camon 19", "Camon 20", "Camon 30", "Camon 40",
-            "Pova 4", "Pova 5", "Pova 6", "Pova 7",
-        ],
-        "OPPO": [
-            "A16", "A17", "A18", "A38", "A58", "A78", "A98",
-            "Reno 7", "Reno 8", "Reno 10", "Reno 11", "Reno 12", "Reno 13",
-            "Find X5 Pro", "Find X6 Pro", "Find X7 Ultra",
-        ],
-        "Vivo": [
-            "Y20", "Y21", "Y22", "Y27", "Y36", "Y38", "Y50",
-            "V23", "V25", "V27", "V29", "V30", "V40",
-            "X80", "X90", "X100", "X200",
-        ],
-    }
-
-    for brand_name, models in model_data.items():
-        row = await fetchone(c, "SELECT id FROM brands WHERE name=?", (brand_name,))
-        if not row:
-            continue
-        brand_id = row[0]
-        for sort, model_name in enumerate(models, 1):
+        defaults = {
+            "start_text": (
+                "🔥 <b>NASTROYKA BOT</b>\n\n"
+                "🎮 Free Fire uchun professional telefon sozlamalari.\n\n"
+                "📱 Telefoningiz brendini tanlang:"
+            ),
+            "support": SUPPORT,
+            "ref_enabled": "1",
+            "welcome_footer": "⚡ Tez • Qulay • Tartibli",
+        }
+        for key, value in defaults.items():
             await c.execute(
-                """
-                INSERT OR IGNORE INTO models(brand_id,name,sort)
-                VALUES(?,?,?)
-                """,
-                (brand_id, model_name, sort)
+                "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT (key) DO NOTHING",
+                (key, value)
             )
 
-    await c.commit()
-    await c.close()
+        # ---- Paketlar (faqat jadval bo'sh bo'lsa) ----
+        pk = await fetchone(c, "SELECT COUNT(*) FROM packages")
+        if int(pk[0]) == 0:
+            packages = [
+                ("BASE", "🟢", 1, "Boshlang‘ich paket", 1),
+                ("PREMIUM", "🟡", 2, "Kengaytirilgan paket", 2),
+                ("VIP", "🔴", 3, "Eng yuqori paket", 3),
+            ]
+            await c.executemany(
+                "INSERT INTO packages(name,emoji,refs,description,sort) VALUES(?,?,?,?,?)",
+                packages
+            )
+
+        # ---- Brendlar (faqat jadval bo'sh bo'lsa) ----
+        bc = await fetchone(c, "SELECT COUNT(*) FROM brands")
+        if int(bc[0]) == 0:
+            brand_data = [
+                ("iPhone", "📱", 1),
+                ("Samsung", "📱", 2),
+                ("Xiaomi", "📱", 3),
+                ("Redmi", "📱", 4),
+                ("POCO", "📱", 5),
+                ("Realme", "📱", 6),
+                ("Infinix", "📱", 7),
+                ("Honor", "📱", 8),
+                ("Tecno", "📱", 9),
+                ("OPPO", "📱", 10),
+                ("Vivo", "📱", 11),
+            ]
+            await c.executemany(
+                "INSERT INTO brands(name,emoji,sort) VALUES(?,?,?) ON CONFLICT (name) DO NOTHING",
+                brand_data
+            )
+
+        await c.execute("UPDATE brands SET emoji='📱'")
+
+        # ---- Modellar (faqat jadval bo'sh bo'lsa) ----
+        mc = await fetchone(c, "SELECT COUNT(*) FROM models")
+        if int(mc[0]) == 0:
+            model_data = {
+                "iPhone": [
+                    "iPhone 11", "iPhone 11 Pro", "iPhone 11 Pro Max",
+                    "iPhone 12", "iPhone 12 Pro", "iPhone 12 Pro Max",
+                    "iPhone 13", "iPhone 13 Pro", "iPhone 13 Pro Max",
+                    "iPhone 14", "iPhone 14 Pro", "iPhone 14 Pro Max",
+                    "iPhone 15", "iPhone 15 Pro", "iPhone 15 Pro Max",
+                    "iPhone 16", "iPhone 16 Pro", "iPhone 16 Pro Max",
+                    "iPhone 17", "iPhone 17 Pro", "iPhone 17 Pro Max",
+                ],
+                "Samsung": [
+                    "Galaxy A15", "Galaxy A25", "Galaxy A35", "Galaxy A55",
+                    "Galaxy S21", "Galaxy S21 Ultra", "Galaxy S22", "Galaxy S22 Ultra",
+                    "Galaxy S23", "Galaxy S23 Ultra", "Galaxy S24", "Galaxy S24 Ultra",
+                    "Galaxy S25", "Galaxy S25 Ultra", "Galaxy S26", "Galaxy S26 Ultra",
+                    "Galaxy Note 20", "Galaxy Z Flip 5", "Galaxy Z Fold 5",
+                    "Galaxy Z Flip 6", "Galaxy Z Fold 6",
+                ],
+                "Xiaomi": [
+                    "Xiaomi 12", "Xiaomi 12 Pro", "Xiaomi 13", "Xiaomi 13 Pro",
+                    "Xiaomi 14", "Xiaomi 14 Pro", "Xiaomi 15", "Xiaomi 15 Pro",
+                    "Xiaomi 15 Ultra", "Xiaomi 16", "Xiaomi 16 Pro",
+                ],
+                "Redmi": [
+                    "Redmi 10", "Redmi 10C", "Redmi 12", "Redmi 13",
+                    "Redmi 14C", "Redmi Note 10", "Redmi Note 11", "Redmi Note 12",
+                    "Redmi Note 13", "Redmi Note 14", "Redmi Note 15",
+                    "Redmi Note 14 Pro", "Redmi Note 15 Pro",
+                ],
+                "POCO": [
+                    "POCO X3", "POCO X3 Pro", "POCO X4 Pro", "POCO X5 Pro",
+                    "POCO X6", "POCO X6 Pro", "POCO X7", "POCO X7 Pro",
+                    "POCO F4", "POCO F5", "POCO F6", "POCO F7",
+                    "POCO M5", "POCO M6",
+                ],
+                "Realme": [
+                    "Realme 8", "Realme 9", "Realme 10", "Realme 11",
+                    "Realme 12", "Realme 13", "Realme 14",
+                    "Realme C35", "Realme C55", "Realme C67", "Realme C75",
+                    "Realme GT Neo 5", "Realme GT 6", "Realme GT 7",
+                ],
+                "Infinix": [
+                    "Hot 10", "Hot 11", "Hot 12", "Hot 20", "Hot 30",
+                    "Hot 40", "Hot 50", "Hot 60", "Note 10", "Note 12",
+                    "Note 30", "Note 40", "Note 50", "GT 10 Pro", "GT 20 Pro",
+                ],
+                "Honor": [
+                    "X8", "X8a", "X8b", "X9", "X9a", "X9b", "X9c",
+                    "90", "90 Lite", "200", "200 Pro", "400", "400 Pro",
+                    "Magic 5 Pro", "Magic 6 Pro", "Magic 7 Pro",
+                ],
+                "Tecno": [
+                    "Spark 8", "Spark 9", "Spark 10", "Spark 20", "Spark 30", "Spark 40",
+                    "Camon 19", "Camon 20", "Camon 30", "Camon 40",
+                    "Pova 4", "Pova 5", "Pova 6", "Pova 7",
+                ],
+                "OPPO": [
+                    "A16", "A17", "A18", "A38", "A58", "A78", "A98",
+                    "Reno 7", "Reno 8", "Reno 10", "Reno 11", "Reno 12", "Reno 13",
+                    "Find X5 Pro", "Find X6 Pro", "Find X7 Ultra",
+                ],
+                "Vivo": [
+                    "Y20", "Y21", "Y22", "Y27", "Y36", "Y38", "Y50",
+                    "V23", "V25", "V27", "V29", "V30", "V40",
+                    "X80", "X90", "X100", "X200",
+                ],
+            }
+
+            rows_to_insert = []
+            for brand_name, models in model_data.items():
+                row = await fetchone(c, "SELECT id FROM brands WHERE name=?", (brand_name,))
+                if not row:
+                    continue
+                brand_id = row[0]
+                for sort, model_name in enumerate(models, 1):
+                    rows_to_insert.append((brand_id, model_name, sort))
+            await c.executemany(
+                "INSERT INTO models(brand_id,name,sort) VALUES(?,?,?) ON CONFLICT (brand_id,name) DO NOTHING",
+                rows_to_insert
+            )
+    finally:
+        await c.close()
 
 
 # ============================================================
@@ -401,6 +456,7 @@ async def ensure_user(user, referrer: Optional[int] = None):
                     """
                     INSERT INTO users(id,username,first_name,referrals,referred_by,banned,created_at,last_seen)
                     VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT (id) DO NOTHING
                     """,
                     (user.id, user.username, user.first_name or "", 0, referrer, 0, now, now)
                 )
@@ -434,34 +490,34 @@ async def channels_ok(user_id: int) -> bool:
 
 async def finalize_referral(user_id: int):
     c = await db()
-    row = await fetchone(c, "SELECT referred_by FROM users WHERE id=?", (user_id,))
-    if not row or not row[0]:
-        await c.close()
-        return None
+    try:
+        row = await fetchone(c, "SELECT referred_by FROM users WHERE id=?", (user_id,))
+        if not row or not row[0]:
+            return None
 
-    inviter_id = int(row[0])
-    if inviter_id == user_id:
-        await c.close()
-        return None
+        inviter_id = int(row[0])
+        if inviter_id == user_id:
+            return None
 
-    already = await fetchone(c, "SELECT id FROM referrals WHERE invitee_id=?", (user_id,))
-    if already:
-        await c.close()
-        return None
+        already = await fetchone(c, "SELECT id FROM referrals WHERE invitee_id=?", (user_id,))
+        if already:
+            return None
 
-    inviter = await fetchone(c, "SELECT id FROM users WHERE id=? AND banned=0", (inviter_id,))
-    if not inviter:
-        await c.close()
-        return None
+        inviter = await fetchone(c, "SELECT id FROM users WHERE id=? AND banned=0", (inviter_id,))
+        if not inviter:
+            return None
 
-    await c.execute(
-        "INSERT INTO referrals(inviter_id,invitee_id,created_at) VALUES(?,?,?)",
-        (inviter_id, user_id, await now_iso())
-    )
-    await c.execute("UPDATE users SET referrals=referrals+1 WHERE id=?", (inviter_id,))
-    await c.commit()
-    await c.close()
-    return inviter_id
+        async with c.transaction():
+            ins = await c.execute(
+                "INSERT INTO referrals(inviter_id,invitee_id,created_at) VALUES(?,?,?) ON CONFLICT (invitee_id) DO NOTHING",
+                (inviter_id, user_id, await now_iso())
+            )
+            if ins.rowcount != 1:
+                return None
+            await c.execute("UPDATE users SET referrals=referrals+1 WHERE id=?", (inviter_id,))
+        return inviter_id
+    finally:
+        await c.close()
 
 
 async def notify_referrer(inviter_id):
@@ -873,25 +929,30 @@ async def package(callback: CallbackQuery):
         return await callback.answer()
 
     code = "RVX-" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(10))
+    ok = True
     async with db_write_lock:
         c = await db()
-        result = await c.execute(
-            "UPDATE users SET referrals=referrals-? WHERE id=? AND referrals>=?",
-            (required, callback.from_user.id, required)
-        )
-        if result.rowcount != 1:
+        try:
+            async with c.transaction():
+                result = await c.execute(
+                    "UPDATE users SET referrals=referrals-? WHERE id=? AND referrals>=?",
+                    (required, callback.from_user.id, required)
+                )
+                if result.rowcount != 1:
+                    ok = False
+                else:
+                    await c.execute(
+                        """
+                        INSERT INTO codes(code,user_id,brand,model,package,refs_used,used,created_at)
+                        VALUES(?,?,?,?,?,?,0,?)
+                        """,
+                        (code, callback.from_user.id, model_row[1], model_row[0], pkg[1], required, await now_iso())
+                    )
+        finally:
             await c.close()
-            return await callback.answer("❌ Referral yetarli emas.", show_alert=True)
 
-        await c.execute(
-            """
-            INSERT INTO codes(code,user_id,brand,model,package,refs_used,used,created_at)
-            VALUES(?,?,?,?,?,?,0,?)
-            """,
-            (code, callback.from_user.id, model_row[1], model_row[0], pkg[1], required, await now_iso())
-        )
-        await c.commit()
-        await c.close()
+    if not ok:
+        return await callback.answer("❌ Referral yetarli emas.", show_alert=True)
 
     support = await get_setting("support", SUPPORT)
     await edit_callback_page(
@@ -1017,7 +1078,6 @@ async def admin_stats(callback: CallbackQuery):
     channels = await fetchone(c, "SELECT COUNT(*) FROM channels WHERE active=1")
     await c.close()
 
-    # Haqiqiy bazadagi sonni ko'rsatamiz; soxta 190 offset qo'shilmaydi.
     shown_users = int(users[0])
     shown_active = int(active[0])
 
@@ -1026,7 +1086,7 @@ async def admin_stats(callback: CallbackQuery):
         "📊 <b>STATISTIKA</b>\n\n"
         f"👥 Foydalanuvchilar: <b>{shown_users}</b>\n"
         f"🟢 Faol: <b>{shown_active}</b>\n"
-        f"🎁 Referral: <b>{refs[0]}</b>\n"
+        f"🎁 Referral: <b>{int(refs[0])}</b>\n"
         f"🔐 Kodlar: <b>{codes[0]}</b>\n"
         f"✅ Ishlatilgan: <b>{used[0]}</b>\n"
         f"📱 Brendlar: <b>{brands[0]}</b>\n"
@@ -1160,11 +1220,7 @@ async def phone_brands(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("phone_brand:"))
-async def phone_brand_detail(callback: CallbackQuery):
-    if not await admin_guard(callback):
-        return
-    bid = int(callback.data.split(":")[1])
+async def show_brand_detail(callback: CallbackQuery, bid: int):
     c = await db()
     brand_ = await fetchone(c, "SELECT id,name,active FROM brands WHERE id=?", (bid,))
     models = await fetchall(c, "SELECT id,name,active FROM models WHERE brand_id=? ORDER BY sort,id", (bid,))
@@ -1188,6 +1244,13 @@ async def phone_brand_detail(callback: CallbackQuery):
         reply_markup=kb(buttons)
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("phone_brand:"))
+async def phone_brand_detail(callback: CallbackQuery):
+    if not await admin_guard(callback):
+        return
+    await show_brand_detail(callback, int(callback.data.split(":")[1]))
 
 
 @dp.callback_query(F.data == "phone_add_brand")
@@ -1214,7 +1277,10 @@ async def phone_add_brand_save(message: Message, state: FSMContext):
     if len(name) < 2 or len(name) > 40:
         return await message.answer("❌ Brend nomini to‘g‘ri yuboring.")
     c = await db()
-    await c.execute("INSERT OR IGNORE INTO brands(name,emoji,sort) VALUES(?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM brands))", (name, "📱"))
+    await c.execute(
+        "INSERT INTO brands(name,emoji,sort) VALUES(?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM brands)) ON CONFLICT (name) DO NOTHING",
+        (name, "📱")
+    )
     await c.commit()
     await c.close()
     await state.clear()
@@ -1270,7 +1336,10 @@ async def phone_add_model_save(message: Message, state: FSMContext):
     if not bid or len(name) < 2:
         return await message.answer("❌ Model nomini to‘g‘ri yuboring.")
     c = await db()
-    await c.execute("INSERT OR IGNORE INTO models(brand_id,name,sort) VALUES(?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM models WHERE brand_id=?))", (bid, name, bid))
+    await c.execute(
+        "INSERT INTO models(brand_id,name,sort) VALUES(?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM models WHERE brand_id=?)) ON CONFLICT (brand_id,name) DO NOTHING",
+        (bid, name, bid)
+    )
     await c.commit()
     await c.close()
     await state.clear()
@@ -1334,7 +1403,7 @@ async def brand_toggle(callback: CallbackQuery):
     await c.execute("UPDATE brands SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (bid,))
     await c.commit()
     await c.close()
-    await phone_brand_detail(callback)
+    await show_brand_detail(callback, bid)
 
 
 @dp.callback_query(F.data.startswith("model_toggle:"))
@@ -1348,8 +1417,7 @@ async def model_toggle(callback: CallbackQuery):
     await c.commit()
     await c.close()
     if row:
-        callback.data = f"phone_brand:{row[0]}"
-        await phone_brand_detail(callback)
+        await show_brand_detail(callback, int(row[0]))
     else:
         await callback.answer("Model topilmadi", show_alert=True)
 
@@ -1459,7 +1527,10 @@ async def pack_add_save(message: Message, state: FSMContext):
     refs = int(data[1].strip())
     desc = data[2].strip()
     c = await db()
-    await c.execute("INSERT INTO packages(name,emoji,refs,description,sort) VALUES(?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM packages))", (name, "💎", refs, desc))
+    await c.execute(
+        "INSERT INTO packages(name,emoji,refs,description,sort) VALUES(?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM packages))",
+        (name, "💎", refs, desc)
+    )
     await c.commit()
     await c.close()
     await state.clear()
@@ -1575,7 +1646,13 @@ async def channel_save(message: Message, state: FSMContext):
     title = parts[1] if len(parts) > 1 and parts[1] else chat_id
     link = f"https://t.me/{chat_id[1:]}"
     c = await db()
-    await c.execute("INSERT OR REPLACE INTO channels(chat_id,title,link,active) VALUES(?,?,?,1)", (chat_id, title, link))
+    await c.execute(
+        """
+        INSERT INTO channels(chat_id,title,link,active) VALUES(?,?,?,1)
+        ON CONFLICT (chat_id) DO UPDATE SET title=excluded.title, link=excluded.link, active=1
+        """,
+        (chat_id, title, link)
+    )
     await c.commit()
     await c.close()
     await state.clear()
@@ -1714,7 +1791,7 @@ async def ref_save(message: Message, state: FSMContext):
     except Exception:
         return await message.answer("❌ Format: USER_ID | SONI")
     c = await db()
-    result = await c.execute("UPDATE users SET referrals=MAX(0,referrals+?) WHERE id=?", (amount, uid))
+    result = await c.execute("UPDATE users SET referrals=GREATEST(0,referrals+?) WHERE id=?", (amount, uid))
     await c.commit()
     await c.close()
     await state.clear()
@@ -1988,8 +2065,24 @@ polling_task = None
 
 @app.on_event("startup")
 async def startup():
-    global polling_task
+    global polling_task, pool
+
+    if not DATABASE_URL:
+        log.error("DATABASE_URL ENV yo‘q (Neon connection string kerak).")
+        return
+
+    pool = await asyncpg.create_pool(
+        dsn=_clean_dsn(DATABASE_URL),
+        ssl="require",
+        min_size=1,
+        max_size=5,
+        statement_cache_size=0,               # Neon pooler (pgbouncer) uchun shart
+        max_inactive_connection_lifetime=60,  # Neon uxlab qolganda eski ulanishlarni yopadi
+        command_timeout=30,
+    )
     await init_db()
+    log.info("Neon PostgreSQL ulandi.")
+
     if not bot:
         log.error("BOT_TOKEN ENV yo‘q.")
         return
@@ -2029,7 +2122,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global polling_task
+    global polling_task, pool
     if polling_task:
         polling_task.cancel()
         try:
@@ -2038,6 +2131,8 @@ async def shutdown():
             pass
     if bot:
         await bot.session.close()
+    if pool is not None:
+        await pool.close()
 
 
 @app.get("/")
